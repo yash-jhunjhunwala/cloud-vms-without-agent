@@ -151,6 +151,25 @@ class QualysClient:
             if resp.status_code == 200:
                 data = resp.json()
                 connectors = data.get("content", [])
+                
+                # Try to extract account aliases from connectors
+                for conn in connectors:
+                    account_id = ""
+                    alias = ""
+                    
+                    if cloud_type.upper() == "AWS":
+                        account_id = conn.get("awsAccountId", "")
+                        alias = conn.get("accountAlias") or conn.get("name", "")
+                    elif cloud_type.upper() == "AZURE":
+                        account_id = conn.get("subscriptionId", "")
+                        alias = conn.get("name", "")
+                    elif cloud_type.upper() == "GCP":
+                        account_id = conn.get("projectId", "")
+                        alias = conn.get("name", "")
+                    
+                    if account_id and alias and account_id not in self.account_aliases:
+                        self.account_aliases[account_id] = alias
+                
                 print(f"✓ Found {len(connectors)} {cloud_type} connectors")
                 return connectors
             print(f"✗ Connectors API: {resp.status_code}")
@@ -229,12 +248,11 @@ class QualysClient:
                     # Only add if we have an ID and alias, and don't overwrite existing
                     if account_id and alias and account_id not in self.account_aliases:
                         self.account_aliases[account_id] = alias
-                        
-                print(f"✓ Fetched {len(self.account_aliases)} account aliases")
-            else:
-                print(f"⚠ Account aliases unavailable (v3.0 API: {resp.status_code})")
-        except Exception as e:
-            print(f"⚠ Account aliases error: {e}")
+            # Don't print error for 401 - it's expected if user doesn't have v3.0 API access
+            elif resp.status_code != 401:
+                print(f"⚠ v3.0 API: {resp.status_code}")
+        except Exception:
+            pass  # Silently ignore v3.0 API errors - we have fallbacks
         return self.account_aliases
 
     def get_assets_without_agent(self, cloud_type: str = "AWS", hours: Optional[int] = None, updated_hours: Optional[int] = None) -> list[CloudAsset]:
@@ -820,7 +838,7 @@ Version: {VERSION}
         print("\n✗ Authentication failed")
         sys.exit(1)
 
-    # Fetch account aliases
+    # Fetch account aliases from multiple sources
     if args.account_map:
         try:
             with open(args.account_map) as f:
@@ -829,11 +847,14 @@ Version: {VERSION}
         except Exception as e:
             print(f"⚠ Could not load account map: {e}")
     
-    # Fetch aliases for the selected cloud provider
-    client.fetch_account_aliases(args.cloud)
-
-    # Get connectors (for info)
+    # Get connectors first (also extracts aliases from connector names)
     client.get_connectors(args.cloud)
+    
+    # Then try v3.0 API for additional aliases
+    client.fetch_account_aliases(args.cloud)
+    
+    if client.account_aliases:
+        print(f"✓ Total {len(client.account_aliases)} account aliases available")
 
     # Get assets without agent
     assets = client.get_assets_without_agent(args.cloud, args.hours, args.updated_hours)
