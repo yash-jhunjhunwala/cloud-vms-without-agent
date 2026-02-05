@@ -790,15 +790,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Examples:
-  %(prog)s -u USER -p PASS -P US2
-  %(prog)s -u USER -p PASS -P CA1 --hours 24
-  %(prog)s -u USER -p PASS -P EU1 --cloud AZURE
+  %(prog)s -u USER -p PASS -e US2
+  %(prog)s -u USER -p PASS -e CA1 --hours 24
+  %(prog)s -u USER -p PASS -e EU1 --cloud AZURE
 
 Version: {VERSION}
 """)
-    parser.add_argument("-u", "--username", required=True, help="Qualys username")
-    parser.add_argument("-p", "--password", required=True, help="Qualys password")
-    parser.add_argument("-P", "--platform", required=True, choices=list(PLATFORMS.keys()), help="Qualys platform")
+    parser.add_argument("-u", "--username", required=True, help="API username")
+    parser.add_argument("-p", "--password", required=True, help="API password")
+    parser.add_argument("-e", "--platform", required=True, choices=list(PLATFORMS.keys()), help="API platform/endpoint (US1-4, EU1-2, CA1, IN1, AE1, UK1, AU1)")
     parser.add_argument("-c", "--cloud", default="AWS", choices=["AWS", "AZURE", "GCP"], help="Cloud provider")
     parser.add_argument("--hours", type=int, help="Only include assets created in last N hours")
     parser.add_argument("--updated-hours", type=int, help="Only include assets updated in last N hours")
