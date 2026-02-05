@@ -21,7 +21,7 @@ A Python CLI tool to identify cloud virtual machines that don't have a cloud sec
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/cloud-vms-without-agent.git
+git clone https://github.com/yash-jhunjhunwala/cloud-vms-without-agent.git
 cd cloud-vms-without-agent
 
 # Create virtual environment (recommended)
