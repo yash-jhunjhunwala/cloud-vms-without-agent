@@ -160,9 +160,28 @@ class QualysClient:
             return []
 
     def fetch_account_aliases(self, cloud_type: str = "AWS") -> dict[str, str]:
-        """Fetch account/subscription/project aliases using v3.0 Asset Data Connector API."""
+        """Fetch account/subscription/project aliases using multiple APIs."""
         
-        # Map cloud type to API endpoint and field names
+        # First try Connector v1.0 API (has account aliases for AWS)
+        if self.bearer_token and cloud_type.upper() == "AWS":
+            try:
+                url = f"{self.gateway_url}/connectors/v1.0/AWS/list"
+                resp = requests.get(url, headers={
+                    "Authorization": f"Bearer {self.bearer_token}",
+                    "Accept": "application/json"
+                })
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for conn in data.get("content", []):
+                        account_id = conn.get("awsAccountId", "")
+                        # Try multiple fields for alias
+                        alias = conn.get("accountAlias") or conn.get("name") or conn.get("description", "")
+                        if account_id and alias:
+                            self.account_aliases[account_id] = alias
+            except Exception:
+                pass
+        
+        # Also try v3.0 Asset Data Connector API
         api_config = {
             "AWS": {
                 "endpoint": "awsassetdataconnector",
@@ -204,10 +223,11 @@ class QualysClient:
                     for part in id_parts:
                         account_id = account_id.get(part, "") if isinstance(account_id, dict) else ""
                     
-                    # Get alias
-                    alias = conn.get(config["alias_field"], "")
+                    # Get alias - try alias field first, then fall back to name
+                    alias = conn.get(config["alias_field"], "") or conn.get("name", "")
                     
-                    if account_id and alias:
+                    # Only add if we have an ID and alias, and don't overwrite existing
+                    if account_id and alias and account_id not in self.account_aliases:
                         self.account_aliases[account_id] = alias
                         
                 print(f"✓ Fetched {len(self.account_aliases)} account aliases")
@@ -313,6 +333,14 @@ class QualysClient:
                     state = cloud_info.get("state", "")
                 else:
                     account_id = region = instance_id = instance_type = state = ""
+                
+                # Skip terminated instances
+                if state.upper() == "TERMINATED":
+                    continue
+                
+                # Skip assets without account ID (incomplete cloud info)
+                if not account_id:
+                    continue
                 
                 # Collect all sources from sourceInfo
                 sources_found = []
