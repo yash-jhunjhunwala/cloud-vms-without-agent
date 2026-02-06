@@ -256,7 +256,7 @@ class QualysClient:
         return self.account_aliases
 
     def get_assets_without_agent(self, cloud_type: str = "AWS", hours: Optional[int] = None, updated_hours: Optional[int] = None) -> list[CloudAsset]:
-        """Get cloud assets without agent using Host Asset API."""
+        """Get cloud assets without agent using Host Asset API with pagination."""
         url = f"{self.api_url}/qps/rest/2.0/search/am/hostasset"
         
         # Build filter criteria - filter by cloud type only, agent check is done client-side
@@ -268,137 +268,165 @@ class QualysClient:
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=updated_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
             filters.append(f'<Criteria field="updated" operator="GREATER">{cutoff}</Criteria>')
 
-        xml_request = f"""<?xml version="1.0" encoding="UTF-8"?>
+        assets = []
+        total_fetched = 0
+        last_id = None
+        page = 1
+        
+        while True:
+            # Build pagination preference
+            if last_id:
+                pagination = f'<startFromId>{last_id}</startFromId>'
+            else:
+                pagination = ''
+            
+            xml_request = f"""<?xml version="1.0" encoding="UTF-8"?>
 <ServiceRequest>
-    <preferences><limitResults>1000</limitResults></preferences>
+    <preferences><limitResults>1000</limitResults>{pagination}</preferences>
     <filters>{' '.join(filters)}</filters>
 </ServiceRequest>"""
 
-        assets = []
-        try:
-            resp = requests.post(url, data=xml_request, auth=HTTPBasicAuth(self.username, self.password),
-                                 headers={"Content-Type": "application/xml", "Accept": "application/json"})
-            if resp.status_code != 200:
-                print(f"✗ Host Asset API: {resp.status_code}")
-                return []
+            try:
+                resp = requests.post(url, data=xml_request, auth=HTTPBasicAuth(self.username, self.password),
+                                     headers={"Content-Type": "application/xml", "Accept": "application/json"})
+                if resp.status_code != 200:
+                    print(f"✗ Host Asset API: {resp.status_code}")
+                    break
 
-            data = resp.json()
-            host_assets = data.get("ServiceResponse", {}).get("data", [])
-            total_count = len(host_assets)
-            
-            for item in host_assets:
-                host = item.get("HostAsset", {})
+                data = resp.json()
+                service_response = data.get("ServiceResponse", {})
+                host_assets = service_response.get("data", [])
+                has_more = service_response.get("hasMoreRecords", False)
                 
-                # Skip assets that have an agent installed
-                if host.get("agentInfo"):
-                    continue
+                if not host_assets:
+                    break
                 
-                # Extract cloud details from sourceInfo
-                source_info = host.get("sourceInfo", {})
-                source_list = source_info.get("list", []) if isinstance(source_info, dict) else []
+                total_fetched += len(host_assets)
+                if page > 1:
+                    print(f"  Fetching page {page}... ({total_fetched} assets so far)")
                 
-                # Find cloud-specific source info
-                cloud_info = {}
-                tags = {}
+                for item in host_assets:
+                    host = item.get("HostAsset", {})
+                    last_id = host.get("id")  # Track last ID for pagination
+                    
+                    # Skip assets that have an agent installed
+                    if host.get("agentInfo"):
+                        continue
+                    
+                    # Extract cloud details from sourceInfo
+                    source_info = host.get("sourceInfo", {})
+                    source_list = source_info.get("list", []) if isinstance(source_info, dict) else []
+                    
+                    # Find cloud-specific source info
+                    cloud_info = {}
+                    tags = {}
+                    
+                    for src in source_list:
+                        if "Ec2AssetSourceSimple" in src:
+                            cloud_info = src["Ec2AssetSourceSimple"]
+                            # Extract AWS tags
+                            ec2_tags = cloud_info.get("ec2InstanceTags", {}).get("tags", {}).get("list", [])
+                            for tag_item in ec2_tags:
+                                if "EC2Tags" in tag_item:
+                                    t = tag_item["EC2Tags"]
+                                    tags[t.get("key", "")] = t.get("value", "")
+                            break
+                        elif "AzureAssetSourceSimple" in src:
+                            cloud_info = src["AzureAssetSourceSimple"]
+                            # Extract Azure tags
+                            azure_tags = cloud_info.get("azureVmTags", {}).get("tags", {}).get("list", [])
+                            for tag_item in azure_tags:
+                                if "AzureTags" in tag_item:
+                                    t = tag_item["AzureTags"]
+                                    tags[t.get("key", "")] = t.get("value", "")
+                            break
+                        elif "GcpAssetSourceSimple" in src:
+                            cloud_info = src["GcpAssetSourceSimple"]
+                            # Extract GCP labels
+                            gcp_labels = cloud_info.get("labels", {}).get("list", [])
+                            for label_item in gcp_labels:
+                                if "GcpLabels" in label_item:
+                                    t = label_item["GcpLabels"]
+                                    tags[t.get("key", "")] = t.get("value", "")
+                            break
+                    
+                    # Map fields based on cloud provider
+                    if cloud_type.upper() == "AWS":
+                        account_id = cloud_info.get("accountId", "")
+                        region = cloud_info.get("region", "")
+                        instance_id = cloud_info.get("instanceId", "")
+                        instance_type = cloud_info.get("instanceType", "")
+                        state = cloud_info.get("instanceState", "")
+                    elif cloud_type.upper() == "AZURE":
+                        account_id = cloud_info.get("subscriptionId", "")
+                        region = cloud_info.get("location", "")
+                        instance_id = cloud_info.get("vmId", "")
+                        instance_type = cloud_info.get("vmSize", "")
+                        state = cloud_info.get("state", "")
+                    elif cloud_type.upper() == "GCP":
+                        account_id = cloud_info.get("projectId", "")
+                        region = cloud_info.get("zone", "")
+                        instance_id = cloud_info.get("instanceId", "")
+                        instance_type = cloud_info.get("machineType", "")
+                        state = cloud_info.get("state", "")
+                    else:
+                        account_id = region = instance_id = instance_type = state = ""
+                    
+                    # Skip terminated instances
+                    if state.upper() == "TERMINATED":
+                        continue
+                    
+                    # Skip assets without account ID (incomplete cloud info)
+                    if not account_id:
+                        continue
+                    
+                    # Collect all sources from sourceInfo
+                    sources_found = []
+                    for src in source_list:
+                        for key in src.keys():
+                            if key in SOURCE_INFO_MAPPING and SOURCE_INFO_MAPPING[key]:
+                                name, icon = SOURCE_INFO_MAPPING[key]
+                                if name not in [s[0] for s in sources_found]:
+                                    sources_found.append((name, icon))
+                    
+                    # Format sources with icons
+                    if sources_found:
+                        source = ", ".join([f"{icon} {name}" for name, icon in sources_found])
+                    else:
+                        # Fallback to tracking method
+                        tracking_method = host.get("trackingMethod", "")
+                        source = TRACKING_SOURCES.get(tracking_method, tracking_method)
+                    
+                    asset = CloudAsset(
+                        asset_id=str(host.get("id", "")),
+                        name=host.get("name", ""),
+                        cloud_provider=host.get("cloudProvider", cloud_type),
+                        account_id=account_id,
+                        account_alias=self.account_aliases.get(account_id, ""),
+                        region=region,
+                        instance_id=instance_id,
+                        instance_type=instance_type,
+                        private_ip=cloud_info.get("privateIpAddress", ""),
+                        public_ip=cloud_info.get("publicIpAddress", ""),
+                        state=state,
+                        source=source,
+                        created=host.get("created", ""),
+                        last_updated=host.get("modified", ""),
+                        tags=tags
+                    )
+                    assets.append(asset)
                 
-                for src in source_list:
-                    if "Ec2AssetSourceSimple" in src:
-                        cloud_info = src["Ec2AssetSourceSimple"]
-                        # Extract AWS tags
-                        ec2_tags = cloud_info.get("ec2InstanceTags", {}).get("tags", {}).get("list", [])
-                        for tag_item in ec2_tags:
-                            if "EC2Tags" in tag_item:
-                                t = tag_item["EC2Tags"]
-                                tags[t.get("key", "")] = t.get("value", "")
-                        break
-                    elif "AzureAssetSourceSimple" in src:
-                        cloud_info = src["AzureAssetSourceSimple"]
-                        # Extract Azure tags
-                        azure_tags = cloud_info.get("azureVmTags", {}).get("tags", {}).get("list", [])
-                        for tag_item in azure_tags:
-                            if "AzureTags" in tag_item:
-                                t = tag_item["AzureTags"]
-                                tags[t.get("key", "")] = t.get("value", "")
-                        break
-                    elif "GcpAssetSourceSimple" in src:
-                        cloud_info = src["GcpAssetSourceSimple"]
-                        # Extract GCP labels
-                        gcp_labels = cloud_info.get("labels", {}).get("list", [])
-                        for label_item in gcp_labels:
-                            if "GcpLabels" in label_item:
-                                t = label_item["GcpLabels"]
-                                tags[t.get("key", "")] = t.get("value", "")
-                        break
+                # Check if there are more records
+                if not has_more or len(host_assets) < 1000:
+                    break
+                    
+                page += 1
                 
-                # Map fields based on cloud provider
-                if cloud_type.upper() == "AWS":
-                    account_id = cloud_info.get("accountId", "")
-                    region = cloud_info.get("region", "")
-                    instance_id = cloud_info.get("instanceId", "")
-                    instance_type = cloud_info.get("instanceType", "")
-                    state = cloud_info.get("instanceState", "")
-                elif cloud_type.upper() == "AZURE":
-                    account_id = cloud_info.get("subscriptionId", "")
-                    region = cloud_info.get("location", "")
-                    instance_id = cloud_info.get("vmId", "")
-                    instance_type = cloud_info.get("vmSize", "")
-                    state = cloud_info.get("state", "")
-                elif cloud_type.upper() == "GCP":
-                    account_id = cloud_info.get("projectId", "")
-                    region = cloud_info.get("zone", "")
-                    instance_id = cloud_info.get("instanceId", "")
-                    instance_type = cloud_info.get("machineType", "")
-                    state = cloud_info.get("state", "")
-                else:
-                    account_id = region = instance_id = instance_type = state = ""
-                
-                # Skip terminated instances
-                if state.upper() == "TERMINATED":
-                    continue
-                
-                # Skip assets without account ID (incomplete cloud info)
-                if not account_id:
-                    continue
-                
-                # Collect all sources from sourceInfo
-                sources_found = []
-                for src in source_list:
-                    for key in src.keys():
-                        if key in SOURCE_INFO_MAPPING and SOURCE_INFO_MAPPING[key]:
-                            name, icon = SOURCE_INFO_MAPPING[key]
-                            if name not in [s[0] for s in sources_found]:
-                                sources_found.append((name, icon))
-                
-                # Format sources with icons
-                if sources_found:
-                    source = ", ".join([f"{icon} {name}" for name, icon in sources_found])
-                else:
-                    # Fallback to tracking method
-                    tracking_method = host.get("trackingMethod", "")
-                    source = TRACKING_SOURCES.get(tracking_method, tracking_method)
-                
-                asset = CloudAsset(
-                    asset_id=str(host.get("id", "")),
-                    name=host.get("name", ""),
-                    cloud_provider=host.get("cloudProvider", cloud_type),
-                    account_id=account_id,
-                    account_alias=self.account_aliases.get(account_id, ""),
-                    region=region,
-                    instance_id=instance_id,
-                    instance_type=instance_type,
-                    private_ip=cloud_info.get("privateIpAddress", ""),
-                    public_ip=cloud_info.get("publicIpAddress", ""),
-                    state=state,
-                    source=source,
-                    created=host.get("created", ""),
-                    last_updated=host.get("modified", ""),
-                    tags=tags
-                )
-                assets.append(asset)
+            except Exception as e:
+                print(f"✗ Assets error: {e}")
+                break
 
-            print(f"✓ Found {len(assets)} assets without agent (of {total_count} total {cloud_type} assets)")
-        except Exception as e:
-            print(f"✗ Assets error: {e}")
+        print(f"✓ Found {len(assets)} assets without agent (of {total_fetched} total {cloud_type} assets)")
         return assets
 
 
@@ -722,6 +750,10 @@ def generate_html_report(assets: list[CloudAsset], filename: str, platform: str)
                 <option value="">All Regions</option>
                 {''.join(f'<option value="{escape(r)}">{escape(r)}</option>' for r in sorted(set(a.region for a in assets if a.region)))}
             </select>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--gray-700);">
+                <input type="checkbox" id="showStopped" onchange="filterTable()" style="width:18px;height:18px;cursor:pointer;">
+                Show Stopped/Terminated
+            </label>
             <button class="export-btn" onclick="exportVisible()">📥 Export Filtered CSV</button>
         </div>
         <div class="table-container">
@@ -743,7 +775,8 @@ def generate_html_report(assets: list[CloudAsset], filename: str, platform: str)
 """
     for a in assets:
         state_class = 'state-running' if a.state.upper() == 'RUNNING' else 'state-stopped' if a.state.upper() in ('STOPPED', 'TERMINATED', 'DEALLOCATED') else ''
-        html += f"""<tr data-account="{escape(a.account_id)}" data-alias="{escape(a.account_alias)}">
+        is_stopped = a.state.upper() in ('STOPPED', 'TERMINATED', 'DEALLOCATED', 'STOPPING')
+        html += f"""<tr data-account="{escape(a.account_id)}" data-alias="{escape(a.account_alias)}" data-stopped="{str(is_stopped).lower()}">
     <td>{escape(a.name)}</td>
     <td>{escape(a.account_id)}</td>
     <td>{escape(a.account_alias)}</td>
@@ -764,16 +797,21 @@ function filterTable() {
     const search = document.getElementById('search').value.toLowerCase();
     const account = document.getElementById('accountFilter').value;
     const region = document.getElementById('regionFilter').value;
+    const showStopped = document.getElementById('showStopped').checked;
     document.querySelectorAll('#assetsTable tbody tr').forEach(row => {
         const text = row.textContent.toLowerCase();
         const rowAccount = row.dataset.account + ' (' + row.dataset.alias + ')';
         const rowRegion = row.cells[3].textContent;
+        const isStopped = row.dataset.stopped === 'true';
         const matchSearch = !search || text.includes(search);
         const matchAccount = !account || rowAccount === account || row.dataset.account === account;
         const matchRegion = !region || rowRegion === region;
-        row.classList.toggle('hidden', !(matchSearch && matchAccount && matchRegion));
+        const matchState = showStopped || !isStopped;
+        row.classList.toggle('hidden', !(matchSearch && matchAccount && matchRegion && matchState));
     });
 }
+// Apply filter on page load to hide stopped/terminated by default
+document.addEventListener('DOMContentLoaded', filterTable);
 let sortDir = 1;
 function sortTable(col) {
     const tbody = document.querySelector('#assetsTable tbody');
@@ -808,8 +846,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Examples:
-  %(prog)s -u USER -p PASS -e US2
-  %(prog)s -u USER -p PASS -e CA1 --hours 24
+  %(prog)s -u USER -p PASS -e US2                    # Last 7 days (default)
+  %(prog)s -u USER -p PASS -e CA1 --all              # All assets (no time filter)
+  %(prog)s -u USER -p PASS -e CA1 --hours 24         # Created in last 24 hours
+  %(prog)s -u USER -p PASS -e EU1 --updated-hours 4  # Updated in last 4 hours
   %(prog)s -u USER -p PASS -e EU1 --cloud AZURE
 
 Version: {VERSION}
@@ -819,16 +859,29 @@ Version: {VERSION}
     parser.add_argument("-e", "--platform", required=True, choices=list(PLATFORMS.keys()), help="API platform/endpoint (US1-4, EU1-2, CA1, IN1, AE1, UK1, AU1)")
     parser.add_argument("-c", "--cloud", default="AWS", choices=["AWS", "AZURE", "GCP"], help="Cloud provider")
     parser.add_argument("--hours", type=int, help="Only include assets created in last N hours")
-    parser.add_argument("--updated-hours", type=int, help="Only include assets updated in last N hours")
+    parser.add_argument("--updated-hours", type=int, default=168, help="Only include assets updated in last N hours (default: 168 = 7 days)")
+    parser.add_argument("--all", action="store_true", help="Fetch all assets (no time filter, overrides defaults)")
     parser.add_argument("--account-map", help="JSON file mapping account IDs to aliases")
     parser.add_argument("-o", "--output", default="cloud_vms_no_agent_report", help="Output filename prefix")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}")
 
     args = parser.parse_args()
+    
+    # If --all is specified, clear time filters
+    if args.all:
+        args.hours = None
+        args.updated_hours = None
 
     print(f"\n{'='*60}")
     print(f" Cloud VMs Without Agent Report - v{VERSION}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+    if args.all:
+        print(f" Time Filter: All assets (no time filter)")
+    elif args.hours:
+        print(f" Time Filter: Created in last {args.hours} hours")
+    elif args.updated_hours:
+        print(f" Time Filter: Updated in last {args.updated_hours} hours ({args.updated_hours // 24} days)")
+    print()
 
     # Initialize client
     client = QualysClient(args.username, args.password, args.platform)
